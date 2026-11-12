@@ -6,15 +6,53 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-echo "[+] بدء إعداد النظام والنفق العكسي (GOST + Cloudflare Tunnel + Watchdog)..."
+echo "[+] بدء إعداد النظام، النفق العكسي، وسطح المكتب البعيد (xRDP + GOST + Watchdog)..."
 
-# 1. تحديث النظام وتثبيت الأدوات اللازمة
+# 1. تحديث النظام وتثبيت الأدوات الأساسية
 apt-get update && apt-get install -y curl wget screen git jq systemd ufw
 
-# 2. تنزيل وتثبيت أحدث إصدار من GOST
+# 2. تثبيت واجهة سطح المكتب الخفيفة (XFCE) وخدمة xRDP للاتصال البعيد
+echo "[+] جاري تثبيت واجهة XFCE وخدمة xRDP..."
+DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xrdp
+
+# إعداد xRDP لاستخدام واجهة XFCE
+echo "startxfce4" > ~/.xsession
+sed -i '/x-session-manager/s/^/#/' /etc/xrdp/startwm.sh 2>/dev/null
+echo "startxfce4" >> /etc/xrdp/startwm.sh
+
+# تفعيل وتشغيل xRDP
+systemctl enable xrdp
+systemctl restart xrdp
+
+# 3. إنشاء أو استخراج بيانات الدخول الخاصة بالريموت ديسكتوب
+REMOTE_USER="root"
+# إذا كنت ترغب بإنشاء مستخدم جديد مخصص للريموت، يمكنك تفعيل الأسطر التالية:
+# REMOTE_USER="remote_user"
+# id "$REMOTE_USER" &>/dev/null || useradd -m -s /bin/bash "$REMOTE_USER"
+# echo "$REMOTE_USER:StrongPassword123" | chpasswd
+
+SERVER_IP=$(curl -s ifconfig.me || hostname -I | awk '{print $1}')
+XRDP_PORT=3389
+
+# حفظ بيانات الدخول في ملف خاص للرجوع إليها
+mkdir -p /etc/gost/credentials
+cat << EOF > /etc/gost/credentials/xrdp_access.txt
+========================================
+ بيانات الدخول لسطح المكتب البعيد (xRDP)
+========================================
+- عنوان السيرفر (IP): $SERVER_IP
+- اسم المستخدم: $REMOTE_USER
+- كلمة المرور: (كلمة مرور نظام الجذر أو المستخدم الحالي)
+- منفذ الاتصال (Port): $XRDP_PORT
+========================================
+EOF
+
+echo "[+] تم حفظ بيانات الدخول في: /etc/gost/credentials/xrdp_access.txt"
+
+# 4. تنزيل وتثبيت أحدث إصدار من GOST
 GOST_VERSION=$(curl -s "https://api.github.com/repos/go-gost/gost/releases/latest" | jq -r .tag_name | sed 's/v//')
 if [ -z "$GOST_VERSION" ]; then
-  GOST_VERSION="3.0.0-nightly" # قيمة افتراضية في حال الفشل
+  GOST_VERSION="3.0.0-nightly"
 fi
 echo "[+] جاري تحميل GOST الإصدار: $GOST_VERSION"
 ARCH=$(uname -m)
@@ -32,10 +70,8 @@ mv gost /usr/local/bin/gost
 chmod +x /usr/local/bin/gost
 rm -f gost.tar.gz LICENSE README.md
 
-# 3. إنشاء مجلد الإعدادات
+# 5. إعداد ملف تكوين GOST (توجيه النفق إذا لزم الأمر، مثلاً لتأمين منفذ xRDP أو خدمة أخرى)
 mkdir -p /etc/gost /var/log/gost
-
-# 4. إعداد ملف تكوين GOST (مثال: نفق عكسي محلي إلى منفذ البوت أو الخدمة)
 cat << 'EOF' > /etc/gost/config.yaml
 services:
   - name: service-tunnel
@@ -46,11 +82,11 @@ services:
       type: tcp
     forwarder:
       nodes:
-        - "tcp://127.0.0.1:3000"
+        - "tcp://127.0.0.1:3389"
 EOF
 
-# 5. إنشاء خدمة systemd لـ GOST مع خاصية الحماية والتشغيل التلقائي (Watchdog & Restart)
-cat << 'EOF' > /system/systemd/gost.service 2>/dev/null || cat << 'EOF' > /etc/systemd/system/gost.service
+# 6. إنشاء خدمة systemd لـ GOST
+cat << 'EOF' > /etc/systemd/system/gost.service
 [Unit]
 Description=GOST Reverse Tunnel Service
 After=network.target
@@ -73,29 +109,25 @@ systemctl daemon-reload
 systemctl enable gost.service
 systemctl restart gost.service
 
-# 6. إنشاء سكريبت الـ Heartbeat والمراقبة (Watchdog)
+# 7. إنشاء سكريبت الـ Heartbeat والمراقبة (Watchdog)
 cat << 'EOF' > /usr/local/bin/system_heartbeat.sh
 #!/bin/bash
-# إعدادات Healthchecks.io أو خادم المراقبة الخاص بك
 HEALTH_CHECK_URL="https://hc-ping.com/YOUR-UUID-HERE"
 
 while true; do
-  # التحقق من أن خدمة GOST تعمل
+  # التحقق من عمل GOST
   if ! systemctl is-active --quiet gost.service; then
-    echo "$(date): GOST متوقف! جاري إعادة التشغيل..." >> /var/log/gost/watchdog.log
     systemctl restart gost.service
   fi
 
-  # إرسال نبضة نبض القلب (Heartbeat)
-  if [ -n "$HEALTH_CHECK_URL" ] && [ "$HEALTH_CHECK_URL" != "https://hc-ping.com/YOUR-UUID-HERE" ]; then
-    curl -fsS -m 10 --retry 3 "$HEALTH_CHECK_URL" > /dev/null 2>&1
+  # التحقق من عمل xRDP
+  if ! systemctl is-active --quiet xrdp; then
+    systemctl restart xrdp
   fi
 
-  # فحص البوت العامل داخل جلسة Screen (مثال: بوت باسم "mybot")
-  if ! screen -list | grep -q "mybot"; then
-    echo "$(date): جلسة Screen للبوت غير موجودة، جاري إعادة تشغيل البوت..." >> /var/log/gost/watchdog.log
-    # يمكنك وضع أمر تشغيل البوت الخاص بك هنا
-    # screen -dmS mybot python3 /path/to/bot.py
+  # إرسال نبضة القلب (Heartbeat)
+  if [ -n "$HEALTH_CHECK_URL" ] && [ "$HEALTH_CHECK_URL" != "https://hc-ping.com/YOUR-UUID-HERE" ]; then
+    curl -fsS -m 10 --retry 3 "$HEALTH_CHECK_URL" > /dev/null 2>&1
   fi
 
   sleep 60
@@ -104,11 +136,11 @@ EOF
 
 chmod +x /usr/local/bin/system_heartbeat.sh
 
-# 7. إنشاء خدمة systemd للـ Watchdog والـ Heartbeat الداخلي
+# 8. إعداد خدمة المراقبة systemd
 cat << 'EOF' > /etc/systemd/system/system-watchdog.service
 [Unit]
 Description=System Heartbeat & Watchdog Monitor
-After=network.target gost.service
+After=network.target gost.service xrdp.service
 
 [Service]
 Type=simple
@@ -125,6 +157,7 @@ systemctl daemon-reload
 systemctl enable system-watchdog.service
 systemctl start system-watchdog.service
 
-echo "[+] تم تثبيت وإعداد البنية بنجاح!"
-echo "[*] يمكنك فحص حالة GOST عبر: systemctl status gost"
-echo "[*] يمكنك فحص حالة المراقبة عبر: systemctl status system-watchdog"
+echo "[+] تم اكتمال التثبيت بنجاح!"
+echo "----------------------------------------"
+cat /etc/gost/credentials/xrdp_access.txt
+echo "----------------------------------------"
